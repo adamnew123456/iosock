@@ -227,6 +227,11 @@ fn main() {
         .spawn()
         .unwrap_or_else(|err| die(format!("Could not start process: {}", err)));
 
+    let child_pid = child.id();
+    ctrlc::set_handler(move || {
+        unsafe { libc::kill(child_pid as i32, libc::SIGTERM); }
+    }).unwrap_or_else(|err| die(format!("Could not bind signal handler: {}", err)));
+
     let child_stdin = child.stdin.take().unwrap_or_else(|| die("No stdin pipe for child"));
     let child_stdout = child.stdout.take().unwrap_or_else(|| die("No stdout pipe for child"));
     let child_stderr = child.stderr.take().unwrap_or_else(|| die("No stderr pipe for child"));
