@@ -164,7 +164,7 @@ fn socket_stream_bridge(
 
     let mut events_buf = [Event::new(Events::empty(), 0); 8];
 
-    const BUFFER_BYTES: usize = 32 * 1024 * 1024;
+    const BUFFER_BYTES: usize = 32 * 1024;
     let mut child_stdin_buf: FlipBuffer<u8, BUFFER_BYTES> = FlipBuffer::new();
     let mut child_stdouterr_buf: FlipBuffer<u8, BUFFER_BYTES> = FlipBuffer::new();
 
