@@ -1,3 +1,5 @@
+mod signals;
+
 use std::cell::Cell;
 use std::env::args;
 use std::fmt::Display;
@@ -9,6 +11,7 @@ use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, Stdio, exit};
 use std::thread::spawn;
 
 use epoll::{ControlOptions, Event, Events};
+use signals::kill_child_on_signal;
 
 /// A buffer that contains 2N bytes, which allows a writer to write N bytes at a
 /// time, and a reader to read N bytes at a time.
@@ -227,10 +230,8 @@ fn main() {
         .spawn()
         .unwrap_or_else(|err| die(format!("Could not start process: {}", err)));
 
-    let child_pid = child.id();
-    ctrlc::set_handler(move || {
-        unsafe { libc::kill(child_pid as i32, libc::SIGTERM); }
-    }).unwrap_or_else(|err| die(format!("Could not bind signal handler: {}", err)));
+    kill_child_on_signal(child.id() as i32)
+        .unwrap_or_else(|err| die(format!("Could not bind signal handler: {}", err)));
 
     let child_stdin = child.stdin.take().unwrap_or_else(|| die("No stdin pipe for child"));
     let child_stdout = child.stdout.take().unwrap_or_else(|| die("No stdout pipe for child"));
