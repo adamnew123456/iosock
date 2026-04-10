@@ -365,7 +365,7 @@ impl<Tracer: BridgeTracer> IOBridge<Tracer> {
                 match self.child_stdouterr_buf.read_from(&mut self.child_stdout) {
                     CopyResult::IOCompleted(0) => {
                         self.trace(TraceEvent::Closed(TraceStream::ChildStdout));
-                        return self.epoll_del(&child_stderr_fd).map(|_| false)
+                        return self.epoll_del(&child_stdout_fd).map(|_| false)
                     }
                     CopyResult::IOError(err) => {
                         self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::ChildStdout, err.kind()));
