@@ -538,7 +538,7 @@ impl<Tracer: BridgeTracer> IOBridge<Tracer> {
                         CopyResult::IOCompleted(0) => true,
 
                         // Need to trace IOError because the error is discarded otherwise
-                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe || err.kind() == io::ErrorKind::ConnectionReset => {
                             self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::SocketWrite, err.kind()));
                             true
                         }
