@@ -18,7 +18,7 @@ impl Display for TraceStream {
             TraceStream::ChildStderr => write!(f, "stderr"),
             TraceStream::SocketRead => write!(f, "socket:recv"),
             TraceStream::SocketWrite => write!(f, "socket:send"),
-            TraceStream::Console => write!(f, "socket:console")
+            TraceStream::Console => write!(f, "console")
         }
     }
 }
