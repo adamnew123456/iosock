@@ -24,6 +24,32 @@ struct FlipBuffer<const N: usize> {
     write_cursor: usize,
 }
 
+/// The result of an operation that copies data from a buffer to an IO stream,
+/// or an IO stream to a buffer.
+///
+/// Compared to an [`io::Result`], this conveys more information for
+/// [`FlipBuffer::write_to`] and similar methods that bundle together two
+/// operations. These operations could fail because the buffer is full/empty, or
+/// because the underlying IO stream cannot accept/produce bytes at the moment
+/// we're reading it.
+enum CopyResult {
+    BufferNotReady,
+    IOCompleted(usize),
+    IOError(io::Error)
+}
+
+/// Converts an [`io::Result`] from an IO operation (returning a byte count)
+/// into a [`CopyResult`]. This never returns a [`CopyResult::BufferNotReady`]
+/// because the buffer must have space available for the IO operation to begin.
+impl From<io::Result<usize>> for CopyResult {
+    fn from(value: io::Result<usize>) -> Self {
+        match value {
+            Ok(size) => CopyResult::IOCompleted(size),
+            Err(err) => CopyResult::IOError(err)
+        }
+    }
+}
+
 impl<const N: usize> FlipBuffer<N> {
     /// Creates a new FlipBuffer with the provided initial value.
     pub fn new() -> Self {
@@ -58,7 +84,7 @@ impl<const N: usize> FlipBuffer<N> {
 
     /// Provides the readable portion of this buffer to a [`std::io::Read`] to
     /// read as much as possible.
-    pub fn read_from<R: Read>(&mut self, reader: &mut R) -> io::Result<usize> {
+    pub fn read_from<R: Read>(&mut self, reader: &mut R) -> CopyResult {
         if self.write_cursor == N && self.read_cursor == self.read_max {
             // Steal the read buffer if there is no data that we would clobber.
             self.flip_buffers();
@@ -66,20 +92,20 @@ impl<const N: usize> FlipBuffer<N> {
 
         let writable = N - self.write_cursor;
         if writable == 0 {
-            return Ok(0)
+            return CopyResult::BufferNotReady
         }
 
         let slice = &mut self.write_page.get_mut()[self.write_cursor..N];
         reader.read(slice).map(|size| {
             self.write_cursor += size;
             size
-        })
+        }).into()
     }
 
     /// Provides the writable portion of this buffer to a [`std::io::Write`] to
     /// write as much as possible. Any bytes written will not be written again
     /// in future calls.
-    pub fn write_to<W: Write>(&mut self, writer: &mut W) -> io::Result<usize> {
+    pub fn write_to<W: Write>(&mut self, writer: &mut W) -> CopyResult {
         if self.read_cursor == self.read_max && self.write_cursor > 0 {
             // Steal the write buffer if it has some data we can read.
             self.flip_buffers();
@@ -87,14 +113,14 @@ impl<const N: usize> FlipBuffer<N> {
 
         let readable = self.read_max - self.read_cursor;
         if readable == 0 {
-            return Ok(0)
+            return CopyResult::BufferNotReady
         }
 
         let slice = &self.read_page.get_mut()[self.read_cursor..self.read_max];
         writer.write(slice).map(|size| {
             self.read_cursor += size;
             size
-        })
+        }).into()
     }
 
     /// Ignores any data written by [`with_write`] since the last [`with_read`]
@@ -317,19 +343,25 @@ impl IOBridge {
             // things to prevent the writers from blocking due to lack of write
             // buffer space.
             if target == child_stdout_fd {
-                self.child_stdouterr_buf
-                    .read_from(&mut self.child_stdout)
-                    .or_else(|err| {
-                        eprintln!("Error writing to child stdout: {}", err);
-                        self.epoll_del(&child_stdout_fd).map(|_| 0)
-                    })?;
+                match self.child_stdouterr_buf.read_from(&mut self.child_stdout) {
+                    CopyResult::IOCompleted(0) => {
+                        return self.epoll_del(&child_stderr_fd).map(|_| false)
+                    }
+                    CopyResult::IOError(_) => {
+                        return self.epoll_del(&child_stdout_fd).map(|_| false)
+                    }
+                    _ => ()
+                }
             } else if target == child_stderr_fd {
-                self.child_stdouterr_buf
-                    .read_from(&mut self.child_stderr)
-                    .or_else(|err| {
-                        eprintln!("Error writing to child stderr: {}", err);
-                        self.epoll_del(&child_stderr_fd).map(|_| 0)
-                    })?;
+                match self.child_stdouterr_buf.read_from(&mut self.child_stderr) {
+                    CopyResult::IOCompleted(0) => {
+                        return self.epoll_del(&child_stderr_fd).map(|_| false)
+                    }
+                    CopyResult::IOError(_) => {
+                        return self.epoll_del(&child_stderr_fd).map(|_| false)
+                    }
+                    _ => ()
+                }
             } else if target == listener_fd {
                 let unix_listener = self.unix_listener.as_ref().unwrap();
                 match unix_listener.accept() {
@@ -364,12 +396,14 @@ impl IOBridge {
                 }
             } else if let Some(client) = self.unix_client.as_mut() {
                 match self.child_stdin_buf.read_from(client) {
-                    Ok(0) => self.shutdown_unix_client(Shutdown::Read)?,
-                    Ok(_) => (),
-                    Err(err) => {
+                    CopyResult::IOCompleted(0) => {
+                        self.shutdown_unix_client(Shutdown::Read)?
+                    },
+                    CopyResult::IOError(err) => {
                         eprintln!("Error reading from client socket: {}", err);
                         self.unix_client = None;
                     }
+                    _ => (),
                 }
             }
         }
@@ -382,13 +416,17 @@ impl IOBridge {
     /// for either operation then discard the original buffer instead.
     fn send_buffers(&mut self) -> io::Result<()> {
         if self.child_stdin_open {
-            if let Err(err) = self
-                .child_stdin_buf
-                .write_to(&mut self.child_stdin)
-            {
-                eprintln!("Error writing to child stdin: {}", err);
-                self.child_stdin_buf.discard();
-                self.child_stdin_open = false;
+            match self.child_stdin_buf.write_to(&mut self.child_stdin) {
+                CopyResult::IOCompleted(0) => {
+                    self.child_stdin_buf.discard();
+                    self.child_stdin_open = false;
+                },
+                CopyResult::IOError(err) => {
+                    eprintln!("Error writing to child stdin: {}", err);
+                    self.child_stdin_buf.discard();
+                    self.child_stdin_open = false;
+                },
+                _ => ()
             }
         } else {
             self.child_stdin_buf.discard();
@@ -403,26 +441,30 @@ impl IOBridge {
                 self.child_stdouterr_buf.discard()
             }
             (None, _, true) => {
-                if let Err(err) = self
-                    .child_stdouterr_buf
-                    .write_to(&mut stdout())
-                {
-                    if err.kind() == io::ErrorKind::BrokenPipe {
-                        self.parent_stdout_open = false;
-                        self.child_stdouterr_buf.discard();
-                    } else {
-                        return Err(err);
-                    }
+                let parent_stdout_closed =
+                    match self.child_stdouterr_buf.write_to(&mut stdout()) {
+                        CopyResult::IOCompleted(0)  => true,
+                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => true,
+                        CopyResult::IOError(err) => return Err(err),
+                        _ => false
+                    };
+                if parent_stdout_closed {
+                    // Don't log this, if stdout is dead then stderr probably is too
+                    self.parent_stdout_open = false;
+                    self.child_stdouterr_buf.discard();
                 }
             }
             (Some(client), _, _) => {
-                if let Err(err) = self.child_stdouterr_buf.write_to(client) {
-                    if err.kind() == io::ErrorKind::BrokenPipe {
-                        self.shutdown_unix_client(Shutdown::Write)?;
-                        self.child_stdouterr_buf.discard();
-                    } else {
-                        return Err(err);
-                    }
+                let unix_client_closed =
+                    match self.child_stdouterr_buf.write_to(client) {
+                        CopyResult::IOCompleted(0) => true,
+                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => true,
+                        CopyResult::IOError(err) => return Err(err),
+                        _ => false
+                    };
+                if unix_client_closed {
+                    self.shutdown_unix_client(Shutdown::Write)?;
+                    self.child_stdouterr_buf.discard();
                 }
             }
         }
