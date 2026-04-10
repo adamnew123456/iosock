@@ -9,6 +9,8 @@ use std::process::{ChildStderr, ChildStdin, ChildStdout};
 
 use epoll::{ControlOptions, Event, Events};
 
+use crate::tracing::{TraceBuffer, TraceEvent, TraceStream, BridgeTracer};
+
 /// A buffer that contains 2N bytes, which allows a writer to write N bytes at a
 /// time, and a reader to read N bytes at a time.
 ///
@@ -169,7 +171,9 @@ impl Display for ShutdownDisplay {
 
 /// Manages the IO operations that copy data to and from the child process,
 /// using either a Unix domain socket or our stdout.
-struct IOBridge {
+struct IOBridge<Tracer: BridgeTracer> {
+    tracer: Tracer,
+
     // IO targets
     unix_listener: Option<UnixListener>,
     unix_client: Option<UnixStream>,
@@ -211,9 +215,10 @@ struct IOBridge {
     child_stdin_open: bool,
 }
 
-impl IOBridge {
+impl<Tracer: BridgeTracer> IOBridge<Tracer> {
     /// Creates a new uninitialized IO bridge.
     pub fn new(
+        tracer: Tracer,
         listener: UnixListener,
         child_stdin: ChildStdin,
         child_stdout: ChildStdout,
@@ -221,6 +226,7 @@ impl IOBridge {
         child_notify: PipeReader,
     ) -> Self {
         IOBridge {
+            tracer,
             unix_listener: Some(listener),
             unix_client: None,
             unix_client_status: SocketStatus::SendRecv,
@@ -235,6 +241,10 @@ impl IOBridge {
             child_stdin_open: true,
             parent_stdout_open: true,
         }
+    }
+
+    fn trace(&mut self, event: TraceEvent) {
+        self.tracer.on_trace(event);
     }
 
     /// Registers `target` with our epoll instance, configured to trigger when
@@ -283,11 +293,13 @@ impl IOBridge {
                     // self.unix_client and didn't replace it. This is
                     // intentional - the only interesting error here is ENOTCONN
                     // which we would discard the socket for anyway.
+                    self.trace(TraceEvent::Closed(TraceStream::SocketRead));
                     unix_client.shutdown(direction)?;
                     Some(unix_client)
                 }
                 (Shutdown::Write, SocketStatus::SendRecv) => {
                     self.unix_client_status = SocketStatus::RecvOnly;
+                    self.trace(TraceEvent::Closed(TraceStream::SocketWrite));
                     unix_client.shutdown(direction)?;
                     Some(unix_client)
                 }
@@ -296,11 +308,7 @@ impl IOBridge {
                 // that we're shutting down here. Not an error but report it for
                 // debugging.
                 (Shutdown::Write, SocketStatus::RecvOnly) => {
-                    eprintln!(
-                        "Warning: redundant shutdown on socket (dir={} status={})",
-                        ShutdownDisplay(direction),
-                        self.unix_client_status
-                    );
+                    self.trace(TraceEvent::Closed(TraceStream::SocketWrite));
                     Some(unix_client)
                 }
 
@@ -308,9 +316,20 @@ impl IOBridge {
                 // Including SendOnly avoids an issue where the child process doesn't do any IO and
                 // the only way we know the socket is closed is by repeated recv requests returning
                 // 0 bytes.
-                (Shutdown::Read, _)
-                | (Shutdown::Write, SocketStatus::SendOnly)
-                | (Shutdown::Both, _) => None,
+                (Shutdown::Read, _) => {
+                    self.trace(TraceEvent::Closed(TraceStream::SocketRead));
+                    None
+                }
+                (Shutdown::Write, SocketStatus::SendOnly) => {
+                    self.trace(TraceEvent::Closed(TraceStream::SocketWrite));
+                    None
+                }
+                (Shutdown::Both, _) => {
+                    // FIXME: This should be dead code? We never shutdown both
+                    // ends of the socket at once.
+                    self.trace(TraceEvent::ClientClosed);
+                    None
+                }
             };
         }
         Ok(())
@@ -345,30 +364,52 @@ impl IOBridge {
             if target == child_stdout_fd {
                 match self.child_stdouterr_buf.read_from(&mut self.child_stdout) {
                     CopyResult::IOCompleted(0) => {
+                        self.trace(TraceEvent::Closed(TraceStream::ChildStdout));
                         return self.epoll_del(&child_stderr_fd).map(|_| false)
                     }
-                    CopyResult::IOError(_) => {
+                    CopyResult::IOError(err) => {
+                        self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::ChildStdout, err.kind()));
+                        self.trace(TraceEvent::Closed(TraceStream::ChildStdout));
                         return self.epoll_del(&child_stdout_fd).map(|_| false)
                     }
-                    _ => ()
+                    CopyResult::IOCompleted(bytes) => {
+                        self.trace(TraceEvent::Transferred(TraceBuffer::ChildOutput, TraceStream::ChildStdout, bytes));
+                        ()
+                    }
+                    CopyResult::BufferNotReady => {
+                        self.trace(TraceEvent::TransferFailedBuffer(TraceBuffer::ChildOutput, TraceStream::ChildStdout));
+                        ()
+                    }
                 }
             } else if target == child_stderr_fd {
                 match self.child_stdouterr_buf.read_from(&mut self.child_stderr) {
                     CopyResult::IOCompleted(0) => {
+                        self.trace(TraceEvent::Closed(TraceStream::ChildStderr));
                         return self.epoll_del(&child_stderr_fd).map(|_| false)
                     }
-                    CopyResult::IOError(_) => {
+                    CopyResult::IOError(err) => {
+                        self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::ChildStderr, err.kind()));
+                        self.trace(TraceEvent::Closed(TraceStream::ChildStderr));
                         return self.epoll_del(&child_stderr_fd).map(|_| false)
                     }
-                    _ => ()
+                    CopyResult::IOCompleted(bytes) => {
+                        self.trace(TraceEvent::Transferred(TraceBuffer::ChildOutput, TraceStream::ChildStderr, bytes));
+                        ()
+                    }
+                    CopyResult::BufferNotReady => {
+                        self.trace(TraceEvent::TransferFailedBuffer(TraceBuffer::ChildOutput, TraceStream::ChildStderr));
+                        ()
+                    }
                 }
             } else if target == listener_fd {
                 let unix_listener = self.unix_listener.as_ref().unwrap();
                 match unix_listener.accept() {
                     Ok((new_client, _)) => {
                         if self.unix_client.is_some() {
+                            self.trace(TraceEvent::ClientRejected);
                             drop(new_client)
                         } else {
+                            self.trace(TraceEvent::ClientAccepted);
                             self.epoll_add_readable(&new_client)?;
                             self.unix_client = Some(new_client);
                             self.unix_client_status = SocketStatus::SendRecv;
@@ -390,7 +431,7 @@ impl IOBridge {
                         //   during connect()? Is that possible?)
                         //
                         //   https://github.com/torvalds/linux/blob/b69053dd3ffbc0d2dedbbc86182cdef6f641fe1b/net/socket.c#L1995
-                        eprintln!("Error accepting listener socket: {}", err);
+                        self.trace(TraceEvent::ClientAcceptFailed(err.kind()));
                         self.epoll_del(&listener_fd)?
                     }
                 }
@@ -400,10 +441,17 @@ impl IOBridge {
                         self.shutdown_unix_client(Shutdown::Read)?
                     },
                     CopyResult::IOError(err) => {
-                        eprintln!("Error reading from client socket: {}", err);
+                        self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildInput, TraceStream::SocketRead, err.kind()));
                         self.unix_client = None;
                     }
-                    _ => (),
+                    CopyResult::IOCompleted(bytes) => {
+                        self.trace(TraceEvent::Transferred(TraceBuffer::ChildInput, TraceStream::SocketRead, bytes));
+                        ()
+                    }
+                    CopyResult::BufferNotReady => {
+                        self.trace(TraceEvent::TransferFailedBuffer(TraceBuffer::ChildInput, TraceStream::SocketRead));
+                        ()
+                    }
                 }
             }
         }
@@ -418,17 +466,28 @@ impl IOBridge {
         if self.child_stdin_open {
             match self.child_stdin_buf.write_to(&mut self.child_stdin) {
                 CopyResult::IOCompleted(0) => {
+                    self.trace(TraceEvent::Closed(TraceStream::ChildStdin));
+                    self.trace(TraceEvent::Discarded(TraceBuffer::ChildInput));
                     self.child_stdin_buf.discard();
                     self.child_stdin_open = false;
                 },
                 CopyResult::IOError(err) => {
-                    eprintln!("Error writing to child stdin: {}", err);
+                    self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildInput, TraceStream::ChildStdin, err.kind()));
+                    self.trace(TraceEvent::Discarded(TraceBuffer::ChildInput));
                     self.child_stdin_buf.discard();
                     self.child_stdin_open = false;
                 },
-                _ => ()
+                CopyResult::IOCompleted(bytes) => {
+                    self.trace(TraceEvent::Transferred(TraceBuffer::ChildInput, TraceStream::ChildStdin, bytes));
+                    ()
+                }
+                CopyResult::BufferNotReady => {
+                    self.trace(TraceEvent::TransferFailedBuffer(TraceBuffer::ChildInput, TraceStream::ChildStdin));
+                    ()
+                }
             }
         } else {
+            self.trace(TraceEvent::Discarded(TraceBuffer::ChildInput));
             self.child_stdin_buf.discard();
         }
 
@@ -438,32 +497,67 @@ impl IOBridge {
             self.parent_stdout_open,
         ) {
             (None, _, false) | (Some(_), SocketStatus::RecvOnly, _) => {
+                self.trace(TraceEvent::Discarded(TraceBuffer::ChildOutput));
                 self.child_stdouterr_buf.discard()
             }
             (None, _, true) => {
                 let parent_stdout_closed =
                     match self.child_stdouterr_buf.write_to(&mut stdout()) {
-                        CopyResult::IOCompleted(0)  => true,
-                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => true,
-                        CopyResult::IOError(err) => return Err(err),
-                        _ => false
+                        CopyResult::IOCompleted(0) => {
+                            self.trace(TraceEvent::Closed(TraceStream::Console));
+                            true
+                        },
+                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                            self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::Console, err.kind()));
+                            true
+                        },
+                        CopyResult::IOError(err) => {
+                            self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::Console, err.kind()));
+                            return Err(err)
+                        }
+                        CopyResult::IOCompleted(bytes) => {
+                            self.trace(TraceEvent::Transferred(TraceBuffer::ChildInput, TraceStream::Console, bytes));
+                            false
+                        }
+                        CopyResult::BufferNotReady => {
+                            self.trace(TraceEvent::TransferFailedBuffer(TraceBuffer::ChildInput, TraceStream::Console));
+                            false
+                        }
                     };
                 if parent_stdout_closed {
                     // Don't log this, if stdout is dead then stderr probably is too
                     self.parent_stdout_open = false;
+                    self.trace(TraceEvent::Discarded(TraceBuffer::ChildOutput));
                     self.child_stdouterr_buf.discard();
                 }
             }
             (Some(client), _, _) => {
                 let unix_client_closed =
                     match self.child_stdouterr_buf.write_to(client) {
+                        // No need to trace here, a non-erroring close will be traced by the shutdown function
                         CopyResult::IOCompleted(0) => true,
-                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => true,
-                        CopyResult::IOError(err) => return Err(err),
-                        _ => false
+
+                        // Need to trace IOError because the error is discarded otherwise
+                        CopyResult::IOError(err) if err.kind() == io::ErrorKind::BrokenPipe => {
+                            self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::SocketWrite, err.kind()));
+                            true
+                        }
+                        CopyResult::IOError(err) => {
+                            self.trace(TraceEvent::TransferFailedIO(TraceBuffer::ChildOutput, TraceStream::SocketWrite, err.kind()));
+                            return Err(err)
+                        }
+                        CopyResult::IOCompleted(bytes) => {
+                            self.trace(TraceEvent::Transferred(TraceBuffer::ChildOutput, TraceStream::SocketWrite, bytes));
+                            false
+                        }
+                        CopyResult::BufferNotReady => {
+                            self.trace(TraceEvent::TransferFailedBuffer(TraceBuffer::ChildOutput, TraceStream::SocketWrite));
+                            false
+                        }
                     };
                 if unix_client_closed {
                     self.shutdown_unix_client(Shutdown::Write)?;
+                    self.trace(TraceEvent::Discarded(TraceBuffer::ChildOutput));
                     self.child_stdouterr_buf.discard();
                 }
             }
@@ -489,13 +583,14 @@ impl IOBridge {
 ///
 /// When there is no client on `listener` the data from the child process is
 /// written to the stdout and stderr of this process.
-pub fn socket_stream_bridge(
+pub fn socket_stream_bridge<Tracer: BridgeTracer>(
+    tracer: Tracer,
     listener: UnixListener,
     child_stdin: ChildStdin,
     child_stdout: ChildStdout,
     child_stderr: ChildStderr,
     child_notify: PipeReader,
 ) -> io::Result<()> {
-    let mut bridge = IOBridge::new(listener, child_stdin, child_stdout, child_stderr, child_notify);
+    let mut bridge = IOBridge::new(tracer, listener, child_stdin, child_stdout, child_stderr, child_notify);
     bridge.run()
 }

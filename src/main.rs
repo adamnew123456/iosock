@@ -1,7 +1,8 @@
 mod signals;
 mod sockets;
+mod tracing;
 
-use std::env::args;
+use std::env::{args, var};
 use std::fmt::Display;
 use std::fs::remove_file;
 use std::io::{pipe, Write};
@@ -24,6 +25,11 @@ fn usage() -> ! {
 }
 
 fn main() {
+    let trace_console = match var("IOSOCK_TRACE") {
+        Ok(value) => value.len() > 0,
+        Err(_) => false
+    };
+
     let mut args = args();
     args.next();
     let sock_path = args.next().unwrap_or_else(|| usage());
@@ -63,13 +69,25 @@ fn main() {
         .unwrap_or_else(|| die("No stderr pipe for child"));
 
     let worker = spawn(move || {
-        socket_stream_bridge(
-            listener,
-            child_stdin,
-            child_stdout,
-            child_stderr,
-            closer_read,
-        )
+        if trace_console {
+            socket_stream_bridge(
+                tracing::StderrTracer::new(),
+                listener,
+                child_stdin,
+                child_stdout,
+                child_stderr,
+                closer_read,
+            )
+        } else {
+            socket_stream_bridge(
+                tracing::NoopTracer,
+                listener,
+                child_stdin,
+                child_stdout,
+                child_stderr,
+                closer_read,
+            )
+        }
     });
 
     let wait_result = child.wait();
