@@ -269,8 +269,7 @@ impl IOBridge {
                 // Should not happen: the socket is already shutdown on the end
                 // that we're shutting down here. Not an error but report it for
                 // debugging.
-                (Shutdown::Read, SocketStatus::SendOnly)
-                | (Shutdown::Write, SocketStatus::RecvOnly) => {
+                (Shutdown::Write, SocketStatus::RecvOnly) => {
                     eprintln!(
                         "Warning: redundant shutdown on socket (dir={} status={})",
                         ShutdownDisplay(direction),
@@ -279,7 +278,11 @@ impl IOBridge {
                     Some(unix_client)
                 }
 
-                (Shutdown::Read, SocketStatus::RecvOnly)
+                // Note that this Shutdown::Read check includes both RecvOnly and SendOnly mode.
+                // Including SendOnly avoids an issue where the child process doesn't do any IO and
+                // the only way we know the socket is closed is by repeated recv requests returning
+                // 0 bytes.
+                (Shutdown::Read, _)
                 | (Shutdown::Write, SocketStatus::SendOnly)
                 | (Shutdown::Both, _) => None,
             };
