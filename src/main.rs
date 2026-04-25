@@ -1,23 +1,14 @@
-mod signals;
-mod sockets;
-mod tracing;
-
-use std::env::{args, var};
-use std::fmt::Display;
+use std::env::args;
 use std::fs::remove_file;
-use std::io::{pipe, Write};
+use std::io::{self, pipe, Write};
 use std::os::unix::net::UnixListener;
 use std::process::{exit, Command, Stdio};
 use std::thread::spawn;
 
-use signals::kill_child_on_signal;
-use sockets::socket_stream_bridge;
-
-/// Prints `msg` to stderr and exits the process.
-fn die<D: Display>(msg: D) -> ! {
-    eprintln!("{}", msg);
-    exit(255)
-}
+use iosock::die;
+use iosock::io::IOSockChannelManager;
+use iosock::pollster::Pollster;
+use iosock::signals::kill_child_on_signal;
 
 /// Displays the command-line help and exits the process.
 fn usage() -> ! {
@@ -25,11 +16,6 @@ fn usage() -> ! {
 }
 
 fn main() {
-    let trace_console = match var("IOSOCK_TRACE") {
-        Ok(value) => value.len() > 0,
-        Err(_) => false
-    };
-
     let mut args = args();
     args.next();
     let sock_path = args.next().unwrap_or_else(|| usage());
@@ -68,35 +54,25 @@ fn main() {
         .take()
         .unwrap_or_else(|| die("No stderr pipe for child"));
 
-    let worker = spawn(move || {
-        if trace_console {
-            socket_stream_bridge(
-                tracing::StderrTracer::new(),
-                listener,
-                child_stdin,
-                child_stdout,
-                child_stderr,
-                closer_read,
-            )
-        } else {
-            socket_stream_bridge(
-                tracing::NoopTracer,
-                listener,
-                child_stdin,
-                child_stdout,
-                child_stderr,
-                closer_read,
-            )
-        }
+    let worker = spawn(move || -> io::Result<()> {
+        let channel_manager =
+            IOSockChannelManager::new(child_stdin, child_stdout, child_stderr, listener);
+
+        let pollster = Pollster::new(channel_manager, &closer_read).or_else(|err| {
+            eprintln!("IO thread could not create pollster: {err}");
+            Err(err)
+        })?;
+
+        pollster.run().or_else(|err| {
+            eprintln!("IO thread died: {err}");
+            Err(err)
+        })
     });
 
     let wait_result = child.wait();
     let to_close = [1u8; 1];
     closer_write.write_all(&to_close).unwrap_or_else(|err| {
-        die(format!(
-            "Could not notify writer about child death: {}",
-            err
-        ))
+        eprintln!("Could not notify writer about child death: {}", err);
     });
 
     worker
