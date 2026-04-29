@@ -7,6 +7,7 @@ use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use crate::buffer::*;
 use crate::channel_manager::*;
 use crate::polled_fd::*;
+use crate::pty::*;
 
 /// The opposite of [`Shutdown`], this indicates what operations a socket may
 /// accept. A socket can accept both reads and writes, or just one or the other,
@@ -25,12 +26,179 @@ struct UnixClient {
     availability: SocketAvailability,
 }
 
+/// Abstracts over pipe-based stdio and pty-based stdio when interacting with
+/// child processes.
+pub trait ChildStdio {
+    /// Registers any events for the child process stdio file descriptors.
+    fn initialize(&mut self, fd_set: &mut PolledFdSet);
+
+    /// Returns the file descriptor that writes to the child's stdin, or None if
+    /// the stdin has been closed.
+    fn stdin_fd(&self) -> Option<RawFd>;
+
+    /// Returns the file descriptor that reads from the child's stdout, or None
+    /// if the stdout has been closed.
+    fn stdout_fd(&self) -> Option<RawFd>;
+
+    /// Returns the file descriptor that reads from the child's stderr, or None
+    /// if the stderr has been closed.
+    fn stderr_fd(&self) -> Option<RawFd>;
+
+    /// Reads from the provided buffer into stdin.
+    fn write_stdin(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)>;
+
+    /// Writes from stdout into the provided buffer.
+    fn read_stdout(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)>;
+
+    /// Writes from stderr into the provided buffer.
+    fn read_stderr(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)>;
+
+    /// Closes the provided file descriptor, if it's one of the child's stdio
+    /// file descriptors.
+    fn hangup(&mut self, fd: RawFd, fd_set: &mut PolledFdSet);
+}
+
+/// Used to implement [`ChildStdio`] for pipe-based stdio. stdin, stdout, and
+/// stderr are all distinct pipes that can be read/written and closed
+/// indepdendently.
+pub struct ChildPipes {
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+impl ChildPipes {
+    pub fn new(stdin: ChildStdin, stdout: ChildStdout, stderr: ChildStderr) -> Self {
+        ChildPipes {
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        }
+    }
+}
+
+impl ChildStdio for ChildPipes {
+    fn initialize(&mut self, fd_set: &mut PolledFdSet) {
+        fd_set.register(self.stdin.as_ref().unwrap(), epoll::Events::empty());
+        fd_set.register(self.stdout.as_ref().unwrap(), epoll::Events::EPOLLIN);
+        fd_set.register(self.stderr.as_ref().unwrap(), epoll::Events::EPOLLIN);
+    }
+
+    fn stdin_fd(&self) -> Option<RawFd> {
+        self.stdin.as_ref().map(|f| f.as_raw_fd())
+    }
+
+    fn stdout_fd(&self) -> Option<RawFd> {
+        self.stdout.as_ref().map(|f| f.as_raw_fd())
+    }
+
+    fn stderr_fd(&self) -> Option<RawFd> {
+        self.stderr.as_ref().map(|f| f.as_raw_fd())
+    }
+
+    fn hangup(&mut self, fd: RawFd, fd_set: &mut PolledFdSet) {
+        if self.stdin_fd() == Some(fd) {
+            fd_set.unregister_closed(&fd);
+            self.stdin = None;
+        } else if self.stdout_fd() == Some(fd) {
+            fd_set.unregister_closed(&fd);
+            self.stdout = None;
+        } else if self.stderr_fd() == Some(fd) {
+            fd_set.unregister_closed(&fd);
+            self.stderr = None;
+        }
+    }
+
+    fn write_stdin(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)> {
+        if let Some(stdin) = self.stdin.as_mut() {
+            buffer_to_channel(buffer, stdin)
+        } else {
+            return Ok((false, BufferStateChange::None));
+        }
+    }
+
+    fn read_stdout(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)> {
+        if let Some(stdout) = self.stdout.as_mut() {
+            channel_to_buffer(stdout, buffer)
+        } else {
+            return Ok((false, BufferStateChange::None));
+        }
+    }
+
+    fn read_stderr(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)> {
+        if let Some(stderr) = self.stdout.as_mut() {
+            channel_to_buffer(stderr, buffer)
+        } else {
+            return Ok((false, BufferStateChange::None));
+        }
+    }
+}
+
+/// Used to implement [`ChildStdio`] for pty-based stdio. There is only one
+/// pseudoterminal that is used for reads and writes to the child's stdin,
+/// stdout, and stderr.
+pub struct ChildPty {
+    pty: Option<PtyFile>,
+}
+
+impl ChildPty {
+    pub fn new(pty: PtyFile) -> Self {
+        ChildPty { pty: Some(pty) }
+    }
+}
+
+impl ChildStdio for ChildPty {
+    fn initialize(&mut self, fd_set: &mut PolledFdSet) {
+        fd_set.register(self.pty.as_ref().unwrap(), epoll::Events::EPOLLIN);
+    }
+
+    fn stdin_fd(&self) -> Option<RawFd> {
+        self.pty.as_ref().map(|p| p.as_raw_fd())
+    }
+
+    fn stdout_fd(&self) -> Option<RawFd> {
+        self.stdin_fd()
+    }
+
+    fn stderr_fd(&self) -> Option<RawFd> {
+        // Technically the pty contains both stdout and stderr, but avoid
+        // returning that same fd for both roles since it could lead to
+        // double-reads when two readability checks are done on the fd.
+        None
+    }
+
+    fn hangup(&mut self, fd: RawFd, fd_set: &mut PolledFdSet) {
+        if self.stdin_fd() == Some(fd) {
+            fd_set.unregister_closed(self.pty.as_ref().unwrap());
+            self.pty = None;
+        }
+    }
+
+    fn write_stdin(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)> {
+        if let Some(pty) = self.pty.as_mut() {
+            buffer_to_channel(buffer, pty)
+        } else {
+            return Ok((false, BufferStateChange::None));
+        }
+    }
+
+    fn read_stdout(&mut self, buffer: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)> {
+        if let Some(pty) = self.pty.as_mut() {
+            channel_to_buffer(pty, buffer)
+        } else {
+            return Ok((false, BufferStateChange::None));
+        }
+    }
+
+    fn read_stderr(&mut self, _: &mut FlipBuffer) -> io::Result<(bool, BufferStateChange)> {
+        panic!("ChildPty does not support read_stderr: no dedicated stderr file descriptor");
+    }
+}
+
 /// Contains all the IO channels managed by the program along with their
 /// buffers.
-pub struct IOSockChannelManager {
-    child_stdin: Option<ChildStdin>,
-    child_stdout: Option<ChildStdout>,
-    child_stderr: Option<ChildStderr>,
+pub struct IOSockChannelManager<Stdio: ChildStdio> {
+    child: Stdio,
     console: Option<Stdout>,
     server_socket: UnixListener,
     client_socket: Option<UnixClient>,
@@ -38,17 +206,10 @@ pub struct IOSockChannelManager {
     out_buffer: FlipBuffer,
 }
 
-impl IOSockChannelManager {
-    pub fn new(
-        child_stdin: ChildStdin,
-        child_stdout: ChildStdout,
-        child_stderr: ChildStderr,
-        server_socket: UnixListener,
-    ) -> IOSockChannelManager {
+impl<Stdio: ChildStdio> IOSockChannelManager<Stdio> {
+    pub fn new(stdio: Stdio, server_socket: UnixListener) -> Self {
         IOSockChannelManager {
-            child_stdin: Some(child_stdin),
-            child_stdout: Some(child_stdout),
-            child_stderr: Some(child_stderr),
+            child: stdio,
             console: Some(stdout()),
             server_socket: server_socket,
             client_socket: None,
@@ -104,14 +265,12 @@ impl IOSockChannelManager {
     }
 }
 
-impl ChannelManager for IOSockChannelManager {
+impl<Stdio: ChildStdio> ChannelManager for IOSockChannelManager<Stdio> {
     fn initialize(&mut self, fd_set: &mut PolledFdSet) {
         // OK to use unwrap here. The pollster should be calling this before
         // using any of the event dispatch functions, so these *must* be Some at
         // this point
-        fd_set.register(self.child_stdin.as_ref().unwrap(), epoll::Events::empty());
-        fd_set.register(self.child_stdout.as_ref().unwrap(), epoll::Events::EPOLLIN);
-        fd_set.register(self.child_stderr.as_ref().unwrap(), epoll::Events::EPOLLIN);
+        self.child.initialize(fd_set);
         fd_set.register(&self.server_socket, epoll::Events::EPOLLIN);
         fd_set.register(self.console.as_ref().unwrap(), epoll::Events::empty());
     }
@@ -183,15 +342,15 @@ impl ChannelManager for IOSockChannelManager {
                     // destroy data in the buffer that the output can copy
                     false
                 } else if buffer_state == BufferStateChange::BecameNonEmpty {
-                    match self.child_stdin.as_ref() {
+                    match self.child.stdin_fd() {
                         Some(c) => {
-                            fd_set.modify(c, |pfd| pfd.poll_for_write(true));
+                            fd_set.modify(&c, |pfd| pfd.poll_for_write(true));
                             false
                         }
                         None => true,
                     }
                 } else {
-                    self.child_stdin.is_none()
+                    self.child.stdin_fd().is_none()
                 };
 
                 if should_discard {
@@ -202,48 +361,40 @@ impl ChannelManager for IOSockChannelManager {
             _ => (),
         }
 
-        match self.child_stdout.as_mut() {
-            Some(f) if f.as_raw_fd() == fd => {
-                let (should_close, buffer_state) = channel_to_buffer(f, &mut self.out_buffer)?;
-                let should_discard = if should_close {
-                    self.on_hangup(fd, fd_set)?;
-                    // Nothing was written just now, and discarding now may
-                    // destroy data in the buffer that the output can copy
-                    false
-                } else if buffer_state == BufferStateChange::BecameNonEmpty {
-                    !self.request_primary_output_writable(fd_set)
-                } else {
-                    !self.has_output_channel()
-                };
+        if self.child.stdout_fd() == Some(fd) {
+            let (should_close, buffer_state) = self.child.read_stdout(&mut self.out_buffer)?;
 
-                if should_discard {
-                    self.out_buffer.discard();
-                }
-                return Ok(());
+            let should_discard = if should_close {
+                self.on_hangup(fd, fd_set)?;
+                // Nothing was written just now, and discarding now may
+                // destroy data in the buffer that the output can copy
+                false
+            } else if buffer_state == BufferStateChange::BecameNonEmpty {
+                !self.request_primary_output_writable(fd_set)
+            } else {
+                !self.has_output_channel()
+            };
+
+            if should_discard {
+                self.out_buffer.discard();
             }
-            _ => (),
-        }
+        } else if self.child.stderr_fd() == Some(fd) {
+            let (should_close, buffer_state) = self.child.read_stderr(&mut self.out_buffer)?;
 
-        match self.child_stderr.as_mut() {
-            Some(f) if f.as_raw_fd() == fd => {
-                let (should_close, buffer_state) = channel_to_buffer(f, &mut self.out_buffer)?;
-                let should_discard = if should_close {
-                    self.on_hangup(fd, fd_set)?;
-                    // Nothing was written just now, and discarding now may
-                    // destroy data in the buffer that the output can copy
-                    false
-                } else if buffer_state == BufferStateChange::BecameNonEmpty {
-                    !self.request_primary_output_writable(fd_set)
-                } else {
-                    !self.has_output_channel()
-                };
+            let should_discard = if should_close {
+                self.on_hangup(fd, fd_set)?;
+                // Nothing was written just now, and discarding now may
+                // destroy data in the buffer that the output can copy
+                false
+            } else if buffer_state == BufferStateChange::BecameNonEmpty {
+                !self.request_primary_output_writable(fd_set)
+            } else {
+                !self.has_output_channel()
+            };
 
-                if should_discard {
-                    self.out_buffer.discard();
-                }
-                return Ok(());
+            if should_discard {
+                self.out_buffer.discard();
             }
-            _ => (),
         }
 
         Ok(())
@@ -298,17 +449,14 @@ impl ChannelManager for IOSockChannelManager {
         };
 
         let client_readable = self.client_socket_readable();
-        match self.child_stdin.as_mut() {
-            Some(f) if f.as_raw_fd() == fd => {
-                let (should_close, buffer_state) = buffer_to_channel(&mut self.in_buffer, f)?;
-                if should_close {
-                    self.on_hangup(fd, fd_set)?;
-                } else if buffer_state == BufferStateChange::BecameEmpty && client_readable {
-                    fd_set.modify(f, |pfd| pfd.poll_for_write(false));
-                }
-                return Ok(());
+        if self.child.stdin_fd() == Some(fd) {
+            let (should_close, buffer_state) = self.child.write_stdin(&mut self.in_buffer)?;
+            if should_close {
+                self.on_hangup(fd, fd_set)?;
+            } else if buffer_state == BufferStateChange::BecameEmpty && client_readable {
+                fd_set.modify(&fd, |pfd| pfd.poll_for_write(false));
             }
-            _ => (),
+            return Ok(());
         }
 
         Ok(())
@@ -333,32 +481,12 @@ impl ChannelManager for IOSockChannelManager {
             _ => (),
         };
 
-        match self.child_stdin.as_mut() {
-            Some(c) if c.as_raw_fd() == fd => {
-                fd_set.unregister_closed(c);
-                self.child_stdin = None;
-                self.in_buffer.discard();
-                return Ok(());
-            }
-            _ => (),
-        }
-
-        match self.child_stdout.as_mut() {
-            Some(c) if c.as_raw_fd() == fd => {
-                fd_set.unregister_closed(c);
-                self.child_stdout = None;
-                return Ok(());
-            }
-            _ => (),
-        }
-
-        match self.child_stderr.as_mut() {
-            Some(c) if c.as_raw_fd() == fd => {
-                fd_set.unregister_closed(c);
-                self.child_stderr = None;
-                return Ok(());
-            }
-            _ => (),
+        if self.child.stdin_fd() == Some(fd)
+            || self.child.stdout_fd() == Some(fd)
+            || self.child.stderr_fd() == Some(fd)
+        {
+            self.child.hangup(fd, fd_set);
+            return Ok(());
         }
 
         match self.console.as_mut() {
