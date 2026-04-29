@@ -71,15 +71,26 @@ cleanly shutdown whatever child process iosock is running:
 exec /iosock /volume/cmd.sock /the/real/command
 ```
 
-# Limitations
-
 ## Pseudo-terminals
 
-There is no PTY support, which means that many interactive programs cannot be
-used with this tool, and those that can may offer degraded functionality (like
-lack of tab completion). This is intentional: if you want a fully-featured 
-remote console and don't mind using a specialized client, `sshd` or `telnetd`
-do a better job. iosock is meant to be small with a minimum of dependencies.
+iosock has very basic support for running its child process in a
+pseudo-terminal. This is sufficient only for the most basic tools that use ptys
+for line editing (`bash`, `python3` and other REPLs, etc) and not much else.
+
+To use it, provide `-p` or `--pty` as the first argument.
+
+``` sh
+$ iosock ./cmd.sock bash
+```
+
+If you want to use iosock for controlling more complex applications, look into
+`dtach` and related session managers. These tools implement terminal-aware
+client programs that do a much better job of synchronizing the state of the pty
+and your actual terminal (ensuring raw input, disabling echo, resizing, ...).
+iosock is intended to be used with `nc -U` or another dumb client, which is
+unaware of any of these terminal settings. 
+
+# Limitations
 
 ## Multiple Connections
 
