@@ -117,35 +117,14 @@ impl<Manager: ChannelManager> Pollster<Manager> {
 #[cfg(test)]
 mod test {
     use std::io::{pipe, ErrorKind, PipeWriter, Read, Write};
-    use std::mem::zeroed;
     use std::net::Shutdown;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::panic::catch_unwind;
     use std::path::PathBuf;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-    use std::sync::Mutex;
     use std::thread::JoinHandle;
-    use std::time::Duration;
     use std::{env, fs, thread};
 
-    use crate::signals;
-
     use super::*;
-
-    /// Bypass the `cargo test` default behavior of running tests in multiple
-    /// threads. Our tests are not safe to run in parallel because they
-    /// manipulate signal handlers.
-    ///
-    /// Note that this is not perfect since other tests outside this module will
-    /// run in parallel with at least one of our tests. However, none of them
-    /// use platform interfaces in a way that is likely to cause problems.
-    /// `cargo test` itself could do funny things with signals too but there is
-    /// nothing we can do about that no matter how little parallelism we use.
-    ///
-    /// The other problem with this approach is failure cascades. If a test
-    /// fails while holding this lock then it becomes poisioned, and any
-    /// later test in this module will fail.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(PartialEq, Debug)]
     enum ChannelManagerReq {
@@ -268,9 +247,11 @@ mod test {
     /// Writes all the events received on the channel to stderr. This should
     /// only be used for debugging, since it has no exit condition and will run
     /// until the test process is killed.
-    #[warn(unused)]
-    fn dump_pending_events(req_recv: &Receiver<ChannelManagerReq>,
-                           resp_send: &SyncSender<Vec<ChannelManagerResp>>) {
+    #[allow(unused)]
+    fn dump_pending_events(
+        req_recv: &Receiver<ChannelManagerReq>,
+        resp_send: &SyncSender<Vec<ChannelManagerResp>>,
+    ) {
         loop {
             let event = req_recv.recv().unwrap();
             eprintln!("Received event: {event:?}");
@@ -300,54 +281,20 @@ mod test {
             + Send
             + 'static,
     {
-        let mut sigset: libc::sigset_t = unsafe { zeroed() };
-        signals::safe_sigaddset(&mut sigset, libc::SIGCHLD).unwrap();
-        signals::block_signals(&sigset).unwrap();
+        let (close_read, close_write) = pipe().unwrap();
+        let (channel_manager, req_recv, resp_send) = BlockingChannelManager::new();
+        let helper = thread::spawn(move || {
+            test(close_write, req_recv, resp_send);
+        });
 
-        let child_pid = unsafe { libc::fork() };
-        if child_pid == 0 {
-            let (close_read, close_write) = pipe().unwrap();
-            let (channel_manager, req_recv, resp_send) = BlockingChannelManager::new();
-            let helper = thread::spawn(move || {
-                test(close_write, req_recv, resp_send);
-            });
+        let pollster = Pollster::new(channel_manager, &close_read).unwrap();
+        pollster.run().unwrap();
 
-            let pollster = Pollster::new(channel_manager, &close_read).unwrap();
-            pollster.run().unwrap();
-
-            helper.join().unwrap();
-
-            // Don't do any cleanup that would confuse the test runner
-            unsafe { libc::_exit(0) }
-        } else {
-            // We have to be careful with panics in the parent process. It's OK
-            // if the *child* process dies, we'll be notified either when the
-            // write to the close pipe fails or we receive a SIGCHLD.
-            //
-            // We can't let the *parent* process panic without also killing the
-            // child. The child process is executing a state machine based on
-            // pollster events, so if the pollster doesn't make progress then
-            // the child process could stay alive forever after it's reparented.
-            match catch_unwind(move || {
-                match signals::safe_sigtimedwait(&mut sigset, Duration::from_secs(10)) {
-                    // Nothing to do, the child died as expected
-                    Ok(true) => (),
-                    Ok(false) => panic!("Child ran for too long"),
-                    Err(err) => panic!("Failed waiting for SIGCHLD signal: {err}"),
-                }
-            }) {
-                Ok(_) => (),
-                Err(_) => {
-                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
-                    panic!("Parent process did not complete successfully")
-                }
-            }
-        }
+        helper.join().unwrap();
     }
 
     #[test]
     fn can_stop_via_channel() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_channel_test(|close_write, req_recv, resp_send| {
             use ChannelManagerReq::*;
 
@@ -365,7 +312,6 @@ mod test {
 
     #[test]
     fn pipe_readable_and_hangup() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_channel_test(|close_write, req_recv, resp_send| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -417,7 +363,6 @@ mod test {
 
     #[test]
     fn pipe_readable_unregister() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_channel_test(|close_write, req_recv, resp_send| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -452,7 +397,6 @@ mod test {
 
     #[test]
     fn pipe_readable_partial_read() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_channel_test(|close_write, req_recv, resp_send| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -503,7 +447,6 @@ mod test {
 
     #[test]
     fn pipe_writable() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_channel_test(|close_write, req_recv, resp_send| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -562,7 +505,6 @@ mod test {
 
     #[test]
     fn pipe_writable_no_hangup() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_channel_test(|close_write, req_recv, resp_send| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -630,7 +572,6 @@ mod test {
 
     #[test]
     fn socket_accept_recv_send() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_socket_test(|close_write, req_recv, resp_send, listener, peer_worker| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -690,7 +631,6 @@ mod test {
 
     #[test]
     fn socket_read_shutdown() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_socket_test(|close_write, req_recv, resp_send, listener, peer_worker| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;
@@ -835,7 +775,6 @@ mod test {
 
     #[test]
     fn socket_write_shutdown() {
-        let _lock_handle = TEST_LOCK.lock().unwrap();
         run_socket_test(|close_write, req_recv, resp_send, listener, peer_worker| {
             use ChannelManagerReq::*;
             use ChannelManagerResp::*;

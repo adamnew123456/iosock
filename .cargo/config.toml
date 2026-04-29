@@ -1,0 +1,9 @@
+[env]
+# Used to simplify resource management within the pollster tests. Some tests
+# there use Unix sockets, and to avoid generating garbage sockets they all use
+# the same path.
+#
+# This also avoids some issues when running with --test-threads > 1 in the pty
+# tests. I'm not clear on *why* these fail (maybe the combination of multiple
+# threads and subprocesses?) but they pass if run serially.
+RUST_TEST_THREADS = "1"

@@ -33,56 +33,6 @@ pub(crate) fn safe_sigaddset(sigset: *mut libc::sigset_t, signum: libc::c_int) -
     }
 }
 
-/// Safe wrapper around [`libc::sigprocmask`]. Blocks the signals in the
-/// provided set until they are retrieved via [`safe_sigtimedwait`] or similar.
-#[cfg(test)]
-pub(crate) fn block_signals(sigset: *const libc::sigset_t) -> io::Result<()> {
-    if unsafe { libc::sigprocmask(libc::SIG_BLOCK, sigset, null_mut()) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-/// Safe wrapper around [`libc::sigtimedwait`]. Returns true if one of the
-/// requested signals occurred within the timeout period and false otherwise.
-#[cfg(test)]
-pub(crate) fn safe_sigtimedwait(
-    sigset: *const libc::sigset_t,
-    timeout: Duration,
-) -> io::Result<bool> {
-    let mut timeout_spec: libc::timespec = unsafe { zeroed() };
-    let start_time = Instant::now();
-    let end_time = start_time + timeout;
-    let mut now = start_time;
-
-    loop {
-        let to_wait = end_time - now;
-        timeout_spec.tv_sec = to_wait.as_secs() as i64;
-        timeout_spec.tv_nsec = (to_wait.as_nanos() % 1000000000) as i64;
-
-        let caught_signal = unsafe { libc::sigtimedwait(sigset, null_mut(), &timeout_spec) };
-        if caught_signal != -1 {
-            return Ok(true);
-        }
-
-        let errno = io::Error::last_os_error();
-        match errno.raw_os_error() {
-            Some(libc::EAGAIN) => return Ok(false),
-            // Interrupted by some other kind of signal, keep waiting
-            Some(libc::EINTR) => (),
-            _ => return Err(errno),
-        }
-
-        // Check the elapsed time after the first call, no need to do this on
-        // the very first iteration since start_time == end_time
-        now = Instant::now();
-        if now >= end_time {
-            return Ok(false);
-        }
-    }
-}
-
 /// Safe wrapper around [`libc::sigaction`].
 fn safe_sigaction(signum: libc::c_int, action: *const libc::sigaction) -> io::Result<()> {
     if unsafe { libc::sigaction(signum, action, null_mut()) } == 0 {
