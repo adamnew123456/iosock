@@ -120,11 +120,13 @@ mod test {
     use std::net::Shutdown;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
     use std::thread::JoinHandle;
     use std::{env, fs, thread};
 
     use super::*;
+    use crate::pty::*;
 
     #[derive(PartialEq, Debug)]
     enum ChannelManagerReq {
@@ -849,5 +851,232 @@ mod test {
                 }
             }
         });
+    }
+
+    #[test]
+    fn pty_read_write() {
+        let subproc = Command::new("cat");
+        let (mut child, mut pty_master) = Pty::open().unwrap().spawn(subproc).unwrap();
+
+        run_channel_test(move |close_write, req_recv, resp_send| {
+            use ChannelManagerReq::*;
+            use ChannelManagerResp::*;
+
+            let pty_fd = pty_master.as_raw_fd();
+
+            assert_eq!(Initialize, req_recv.recv().unwrap());
+            resp_send
+                .send(vec![Register(pty_fd, epoll::Events::EPOLLOUT)])
+                .unwrap();
+
+            assert_eq!(OnWritable(pty_fd), req_recv.recv().unwrap());
+            assert_eq!(12, pty_master.write("hello world\n".as_bytes()).unwrap());
+            pty_master.flush().unwrap();
+
+            resp_send
+                .send(vec![
+                    PollWritable(pty_fd, false),
+                    PollReadable(pty_fd, true),
+                ])
+                .unwrap();
+
+            // The timing here will be more unpredictable than with pipes, since
+            // the first read comes from tty echo (in theory this is instant),
+            // and the second comes from cat which has to cross the process
+            // boundary twice.
+            let mut buffer = [0u8; 64];
+            let mut remaining = 24;
+            while remaining > 0 {
+                assert_eq!(OnReadable(pty_fd), req_recv.recv().unwrap());
+                let so_far = 24 - remaining;
+                let chunk = pty_master.read(&mut buffer[so_far..]).unwrap();
+                remaining -= chunk;
+
+                let last_iter = remaining == 0;
+                resp_send
+                    .send(vec![PollWritable(pty_fd, last_iter)])
+                    .unwrap();
+            }
+
+            assert_eq!(
+                "hello world\nhello world\n",
+                String::from_utf8_lossy(&buffer[..24]).into_owned()
+            );
+
+            // Write ^D to kill cat. This should generate no output, the tty
+            // won't echo control characters.
+            assert_eq!(OnWritable(pty_fd), req_recv.recv().unwrap());
+            assert_eq!(1, pty_master.write(b"\x04").unwrap());
+            pty_master.flush().unwrap();
+
+            resp_send.send(Vec::new()).unwrap();
+
+            // We don't get empty readable events when the pty slave hangs up, I
+            // guess because they would return EIO anyway?
+            //
+            // Also unlike pipes we can write to the tty even after the other
+            // end hangs up.
+            let mut seen_writable = false;
+            let mut seen_hup = false;
+            while !(seen_writable && seen_hup) {
+                let event = req_recv.recv().unwrap();
+                match event {
+                    OnWritable(fd) => {
+                        assert_eq!(fd, pty_fd);
+                        resp_send.send(Vec::new()).unwrap();
+                        seen_writable = true;
+                    }
+                    OnHangup(fd) => {
+                        assert_eq!(fd, pty_fd);
+                        resp_send.send(vec![Unregister(fd)]).unwrap();
+                        seen_hup = true;
+                    }
+                    event => panic!("Unexpected event: {event:?}"),
+                }
+            }
+
+            write_close_byte(close_write).unwrap();
+
+            assert_eq!(Drop, req_recv.recv().unwrap());
+            resp_send.send(Vec::new()).unwrap();
+        });
+
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn pty_write_no_read() {
+        let mut subproc = Command::new("sh");
+        subproc.args(["-c", "exec cat >/dev/null"]);
+        let (mut child, mut pty_master) = Pty::open().unwrap().spawn(subproc).unwrap();
+
+        run_channel_test(move |close_write, req_recv, resp_send| {
+            use ChannelManagerReq::*;
+            use ChannelManagerResp::*;
+
+            let pty_fd = pty_master.as_raw_fd();
+
+            assert_eq!(Initialize, req_recv.recv().unwrap());
+            resp_send
+                .send(vec![Register(pty_fd, epoll::Events::EPOLLOUT)])
+                .unwrap();
+
+            assert_eq!(OnWritable(pty_fd), req_recv.recv().unwrap());
+            assert_eq!(12, pty_master.write("hello world\n".as_bytes()).unwrap());
+            pty_master.flush().unwrap();
+
+            resp_send
+                .send(vec![
+                    PollWritable(pty_fd, false),
+                    PollReadable(pty_fd, true),
+                ])
+                .unwrap();
+
+            // No need to loop here, we won't get any subprocess output and the
+            // echo should come back immediately
+            assert_eq!(OnReadable(pty_fd), req_recv.recv().unwrap());
+            let mut buffer = [0u8; 64];
+            assert_eq!(12, pty_master.read(&mut buffer).unwrap());
+            resp_send.send(vec![PollWritable(pty_fd, true)]).unwrap();
+
+            assert_eq!(OnWritable(pty_fd), req_recv.recv().unwrap());
+            assert_eq!(1, pty_master.write(b"\x04").unwrap());
+            pty_master.flush().unwrap();
+
+            resp_send.send(Vec::new()).unwrap();
+
+            let mut seen_writable = false;
+            let mut seen_hup = false;
+            while !(seen_writable && seen_hup) {
+                let event = req_recv.recv().unwrap();
+                match event {
+                    OnWritable(fd) => {
+                        assert_eq!(fd, pty_fd);
+                        resp_send.send(Vec::new()).unwrap();
+                        seen_writable = true;
+                    }
+                    OnHangup(fd) => {
+                        assert_eq!(fd, pty_fd);
+                        resp_send.send(vec![Unregister(fd)]).unwrap();
+                        seen_hup = true;
+                    }
+                    event => panic!("Unexpected event: {event:?}"),
+                }
+            }
+
+            write_close_byte(close_write).unwrap();
+
+            assert_eq!(Drop, req_recv.recv().unwrap());
+            resp_send.send(Vec::new()).unwrap();
+        });
+
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn pty_read_no_write() {
+        let mut subproc = Command::new("sh");
+        subproc.args(["-c", "exec yes"]);
+        let (mut child, mut pty_master) = Pty::open().unwrap().spawn(subproc).unwrap();
+
+        let child_pid = child.id();
+        run_channel_test(move |close_write, req_recv, resp_send| {
+            use ChannelManagerReq::*;
+            use ChannelManagerResp::*;
+
+            let pty_fd = pty_master.as_raw_fd();
+
+            assert_eq!(Initialize, req_recv.recv().unwrap());
+            resp_send
+                .send(vec![Register(pty_fd, epoll::Events::EPOLLIN)])
+                .unwrap();
+
+            // yes will go as long as it wants, just keep going until we've got
+            // some data.
+            let mut buffer = [0u8; 16];
+            let mut remaining = 16;
+            while remaining > 0 {
+                assert_eq!(OnReadable(pty_fd), req_recv.recv().unwrap());
+                let so_far = 16 - remaining;
+                let chunk = pty_master.read(&mut buffer[so_far..]).unwrap();
+                remaining -= chunk;
+
+                resp_send.send(Vec::new()).unwrap();
+            }
+
+            assert_eq!(
+                "y\ny\ny\ny\ny\ny\ny\ny\n",
+                String::from_utf8_lossy(&buffer[..16]).into_owned()
+            );
+
+            // We'll keep getting readable events forever here, kill the
+            // subprocess and drain its output until it reports a HUP
+            unsafe { libc::kill(child_pid as i32, libc::SIGKILL) };
+
+            let mut seen_hup = false;
+            while !seen_hup {
+                let event = req_recv.recv().unwrap();
+                match event {
+                    OnReadable(fd) => {
+                        assert_eq!(fd, pty_fd);
+                        assert!(pty_master.read(&mut buffer).unwrap() > 0);
+                        resp_send.send(Vec::new()).unwrap();
+                    }
+                    OnHangup(fd) => {
+                        assert_eq!(fd, pty_fd);
+                        resp_send.send(vec![Unregister(fd)]).unwrap();
+                        seen_hup = true;
+                    }
+                    event => panic!("Unexpected event: {event:?}"),
+                }
+            }
+
+            write_close_byte(close_write).unwrap();
+
+            assert_eq!(Drop, req_recv.recv().unwrap());
+            resp_send.send(Vec::new()).unwrap();
+        });
+
+        child.wait().unwrap();
     }
 }

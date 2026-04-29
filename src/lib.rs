@@ -5,6 +5,7 @@ pub mod channel_manager;
 pub mod io;
 pub mod polled_fd;
 pub mod pollster;
+pub mod pty;
 pub mod signals;
 
 /// Prints `msg` to stderr and exits the process.
