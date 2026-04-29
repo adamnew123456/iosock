@@ -195,6 +195,8 @@ impl FlipBuffer {
                     change = BufferStateChange::BecameEmpty;
                 }
                 size
+            }).and_then(|size| {
+                writer.flush().map(|_| size)
             })
             .into();
         (result, change)
