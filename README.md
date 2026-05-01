@@ -80,7 +80,7 @@ for line editing (`bash`, `python3` and other REPLs, etc) and not much else.
 To use it, provide `-p` or `--pty` as the first argument.
 
 ``` sh
-$ iosock ./cmd.sock bash
+$ iosock --pty ./cmd.sock bash
 ```
 
 If you want to use iosock for controlling more complex applications, look into
