@@ -491,7 +491,10 @@ impl<Stdio: ChildStdio> ChannelManager for IOSockChannelManager<Stdio> {
 
         match self.console.as_mut() {
             Some(c) if c.as_raw_fd() == fd => {
-                fd_set.unregister_closed(c);
+                // We have to unregister stdout directly here, we can't just
+                // drop self.console because dropping an instance of Stdout
+                // doesn't actually close the stdout file descriptor
+                fd_set.unregister(c);
                 self.console = None;
                 return Ok(());
             }
